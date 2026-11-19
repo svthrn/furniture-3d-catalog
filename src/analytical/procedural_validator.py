@@ -72,6 +72,20 @@ def validate_glb_binary_header(file_bytes: bytes) -> Dict[str, Any]:
     if chunk_type != GLB_CHUNK_TYPE_JSON:
         result["errors"].append(f"Первый чанк не JSON (0x4E4F534A), получено 0x{chunk_type:08X}")
 
+    # Границы первого чанка: данные чанка не должны выходить за конец файла и за объявленную длину
+    chunk_end = GLB_HEADER_SIZE + GLB_CHUNK_HEADER_SIZE + chunk_length
+    if chunk_end > len(file_bytes):
+        result["errors"].append(
+            f"Длина первого чанка {chunk_length} байт выходит за конец файла "
+            f"(конец чанка {chunk_end} > длина файла {len(file_bytes)})"
+        )
+    elif chunk_end > declared_length:
+        result["errors"].append(
+            f"Длина первого чанка {chunk_length} байт выходит за объявленную длину файла {declared_length}"
+        )
+    if chunk_length % 4 != 0:
+        result["errors"].append(f"Длина первого чанка {chunk_length} не кратна 4 (требование выравнивания glTF 2.0)")
+
     if not result["errors"]:
         result["is_valid"] = True
 
@@ -79,7 +93,7 @@ def validate_glb_binary_header(file_bytes: bytes) -> Dict[str, Any]:
 
 
 def validate_model_for_marketplace(model_data: Dict[str, Any], platform_key: str) -> Dict[str, Any]:
-    """Алгоритм 2: Проверка требований маркетплейса (GLB+USDZ, лимит 25 МБ). Сложность O(k)."""
+    """Алгоритм 2: Проверка модели по профилю площадки (форматы, размер, заголовок GLB). Сложность O(k)."""
     if platform_key not in MARKETPLACE_PROFILES:
         return {"status": "ERROR", "message": f"Неизвестный профиль площадки: '{platform_key}'"}
 
@@ -87,8 +101,8 @@ def validate_model_for_marketplace(model_data: Dict[str, Any], platform_key: str
     max_size = profile["max_file_size_bytes"]
     required_formats = set(profile["required_formats"])
 
-    files = model_data.get("files", [])
-    present_formats = set(f.get("format", "").upper() for f in files)
+    files = model_data.get("files") or []
+    present_formats = set(str(f.get("format") or "").upper() for f in files)
 
     report = {
         "sku": model_data.get("sku"),
@@ -108,12 +122,15 @@ def validate_model_for_marketplace(model_data: Dict[str, Any], platform_key: str
 
     # Проверка размера и бинарного заголовка каждого файла
     for f in files:
-        fmt = f.get("format", "").upper()
-        size = f.get("size_bytes", 0)
+        fmt = str(f.get("format") or "").upper()
+        size = f.get("size_bytes")
         content = f.get("content_bytes")
         file_name = f.get("file_name", "model_file")
 
-        if size > max_size:
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            report["status"] = "FAILED"
+            report["file_issues"].append(f"Файл '{file_name}' ({fmt}): размер size_bytes не указан или некорректен")
+        elif size > max_size:
             report["status"] = "FAILED"
             report["file_issues"].append(
                 f"Файл '{file_name}' ({fmt}) превышает лимит: {size / (1024*1024):.2f} МБ > {max_size / (1024*1024):.2f} МБ"
@@ -121,8 +138,14 @@ def validate_model_for_marketplace(model_data: Dict[str, Any], platform_key: str
         else:
             report["passed_checks"].append(f"Файл '{file_name}' укладывается в весовой лимит")
 
-        if fmt == "GLB" and content is not None:
-            header_res = validate_glb_binary_header(content)
+        if fmt == "GLB":
+            if not isinstance(content, (bytes, bytearray)):
+                report["status"] = "FAILED"
+                report["file_issues"].append(
+                    f"Файл '{file_name}' (GLB): content_bytes отсутствуют, заголовок не проверен"
+                )
+                continue
+            header_res = validate_glb_binary_header(bytes(content))
             if not header_res["is_valid"]:
                 report["status"] = "FAILED"
                 report["file_issues"].extend(header_res["errors"])
@@ -130,6 +153,19 @@ def validate_model_for_marketplace(model_data: Dict[str, Any], platform_key: str
                 report["passed_checks"].append(f"Заголовок GLB '{file_name}' валиден")
 
     return report
+
+
+def select_current_model(item: Dict[str, Any], var: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Выбор модели варианта: is_current=True, иначе максимальная version; затем model_3d варианта и товара."""
+    models = var.get("models_3d")
+    if isinstance(models, dict):
+        return models
+    if isinstance(models, list) and models:
+        for m in models:
+            if m.get("is_current", False) is True:
+                return m
+        return max(models, key=lambda m: m.get("version", 1))
+    return var.get("model_3d") or item.get("model_3d") or None
 
 
 def filter_catalog(
@@ -140,13 +176,16 @@ def filter_catalog(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None
 ) -> List[Dict[str, Any]]:
-    """Алгоритм 3: Многокритериальная фильтрация каталога мебели с контролем 3D/AR. Сложность O(N)."""
+    """Алгоритм 3: Многокритериальная фильтрация каталога мебели с контролем 3D/AR.
+    Сложность O(N·V·(m + k + q)). Неизвестный ключ платформы — ValueError."""
+    if platform_readiness and platform_readiness not in MARKETPLACE_PROFILES:
+        raise ValueError(f"Неизвестный профиль площадки: '{platform_readiness}'")
     filtered_items = []
     query_lower = search_query.strip().lower() if search_query else None
 
     for item in catalog:
         # Проверка названия
-        name_matched = bool(query_lower and query_lower in item.get("name", "").lower())
+        name_matched = bool(query_lower and query_lower in str(item.get("name") or "").lower())
 
         # Фильтр категории
         if category:
@@ -162,36 +201,24 @@ def filter_catalog(
         matching_variants = []
 
         for var in variants:
-            var_sku = var.get("sku", "")
+            var_sku = str(var.get("sku") or "")
             sku_matched = bool(query_lower and query_lower in var_sku.lower())
 
             if query_lower and not (name_matched or sku_matched):
                 continue
 
-            price = float(var.get("price", 0.0))
-            if min_price is not None and price < min_price:
-                continue
-            if max_price is not None and price > max_price:
-                continue
+            if min_price is not None or max_price is not None:
+                if var.get("price") is None:
+                    continue  # цена неизвестна — по границам отобрать нельзя
+                price = float(var["price"])
+                if min_price is not None and price < min_price:
+                    continue
+                if max_price is not None and price > max_price:
+                    continue
 
             # Проверка готовности 3D-модели для площадки (is_current == True)
             if platform_readiness:
-                models = var.get("models_3d", [])
-                current_model = None
-
-                if isinstance(models, list):
-                    for m in models:
-                        if m.get("is_current", False) is True:
-                            current_model = m
-                            break
-                    if not current_model and models:
-                        current_model = max(models, key=lambda m: m.get("version", 1))
-                elif isinstance(models, dict):
-                    current_model = models
-                elif var.get("model_3d"):
-                    current_model = var["model_3d"]
-                elif item.get("model_3d"):
-                    current_model = item["model_3d"]
+                current_model = select_current_model(item, var)
 
                 if not current_model:
                     continue
@@ -213,7 +240,7 @@ def filter_catalog(
 
 def create_synthetic_glb() -> bytes:
     """Генерация тестового GLB 2.0 (48 байт)."""
-    json_bytes = b'{"asset":{"version":"2.0"}}   '
+    json_bytes = b'{"asset":{"version":"2.0"}}'.ljust(28, b" ")  # длина чанка кратна 4
     chunk_len = len(json_bytes)
     total_len = GLB_HEADER_SIZE + GLB_CHUNK_HEADER_SIZE + chunk_len
     header = struct.pack('<4sII', GLB_MAGIC, 2, total_len)
@@ -231,6 +258,10 @@ if __name__ == "__main__":
     bad_magic_bytes = b'BADF' + valid_glb_bytes[4:]
     t2 = validate_glb_binary_header(bad_magic_bytes)
     print(f"[ТЕСТ 1.2] Ошибка magic: is_valid={t2['is_valid']}, ошибки={t2['errors']}")
+
+    overlong = valid_glb_bytes[:12] + struct.pack('<II', 4000, GLB_CHUNK_TYPE_JSON) + valid_glb_bytes[20:]
+    t2b = validate_glb_binary_header(overlong)
+    print(f"[ТЕСТ 1.3] Длина JSON-чанка выходит за файл: is_valid={t2b['is_valid']}, ошибки={t2b['errors']}")
 
     # Тесты Алгоритма 2
     model_chair = {
@@ -253,6 +284,12 @@ if __name__ == "__main__":
     }
     t4 = validate_model_for_marketplace(model_sofa_no_usdz, "wildberries")
     print(f"[ТЕСТ 2.2] Диван без USDZ (отклонение WB): вердикт={t4['status']}, ошибки={t4['file_issues']}")
+
+    model_no_bytes = {"sku": "CHAIR-NB", "files": [
+        {"file_name": "c.glb", "format": "GLB", "size_bytes": 1000, "content_bytes": None},
+        {"file_name": "c.usdz", "format": "USDZ", "size_bytes": 1000, "content_bytes": None}]}
+    t5 = validate_model_for_marketplace(model_no_bytes, "wildberries")
+    print(f"[ТЕСТ 2.3] GLB без content_bytes: вердикт={t5['status']}, ошибки={t5['file_issues']}")
 
     # Тесты Алгоритма 3
     sample_catalog = [
