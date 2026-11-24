@@ -127,8 +127,9 @@ class GlbBinaryHeaderValidatorTest {
         byte[] data = TestData.patchUint32(TestData.validGlb(), 4, 1);
         data = TestData.patchUint32(data, 8, 10);
         GlbHeaderResult result = validator.validate(data);
-        assertEquals(2, result.errors().size());
+        assertEquals(3, result.errors().size());
         assertTrue(result.errors().get(0).contains("версия"));
         assertTrue(result.errors().get(1).contains("Длина в заголовке"));
+        assertTrue(result.errors().get(2).contains("выходит за объявленную длину"));
     }
 }
